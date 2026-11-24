@@ -85,6 +85,8 @@ pub mod host;
 mod image_atomic64_tests;
 mod lower;
 mod sampler;
+#[cfg(all(test, windows))]
+mod scratch_tests;
 mod shader;
 #[cfg(windows)]
 pub mod validator;
