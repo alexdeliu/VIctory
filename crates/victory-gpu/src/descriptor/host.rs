@@ -2602,7 +2602,7 @@ void main() {
         let Some(host) = host() else {
             return; // no host GPU
         };
-        let Some(heap) = HostHeap::new(false, 4) else {
+        let Some(heap) = HostHeap::new(false, 4, 0) else {
             return;
         };
         let properties = D3D12_HEAP_PROPERTIES {

@@ -793,7 +793,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod cache_tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
 
@@ -874,7 +874,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod library_tests {
     use super::*;
 
     fn element(format: DXGI_FORMAT, offset: u32) -> D3D12_INPUT_ELEMENT_DESC {

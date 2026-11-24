@@ -73,14 +73,13 @@ static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 pub(crate) fn cached_staging_bytes() -> Option<(u64, usize)> {
     let map = STAGING.try_lock().ok()?;
     let mut upload = 0;
-    let mut read = 0;
     if let Some(map) = map.as_ref() {
         for staging in map.values() {
-            let last = staging.last.try_lock().ok()?;
             upload += staging.size;
-            read += last.read.capacity();
         }
     }
+    // The read room is one buffer shared by every texture (`SCRATCH`).
+    let read = SCRATCH.try_lock().ok()?.capacity();
     Some((upload, read))
 }
 
