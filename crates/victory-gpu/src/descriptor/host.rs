@@ -86,7 +86,9 @@ struct Bindless {
     slots: BTreeMap<u32, (u32, u32)>,
     /// Of them, those viewing placed textures.
     placed_set: BTreeMap<u32, (u32, u32)>,
-    /// Placed-texture slots changed since draws last prepared them.
+    /// Ordinary resource-backed CPU-written texture SRV slots (`View::Shader`).
+    texture_set: BTreeMap<u32, (u32, u32)>,
+    /// Placed-texture and ordinary texture-SRV slots changed since draws last prepared them.
     record_pending: BTreeSet<u32>,
     /// Active 256-byte-aligned bounce slices by `slot_index`.
     cbv_bounce: HashMap<u32, BounceSlot>,
@@ -105,12 +107,12 @@ struct Bindless {
     /// Placed-texture slots as last prepared at recording: view key,
     /// texture.
     recorded: HashMap<u32, (u64, usize)>,
-    /// Placed textures reached through slots, by resource object: the host
-    /// texture (held, so its address names it alone) and the frame last
-    /// uploaded.
-    uploaded: HashMap<usize, (ID3D12Resource, u64)>,
+    /// Textures reached through bindless slots, by resource object: the host
+    /// texture (held, so its address names it alone), the frame last uploaded,
+    /// and whether it is a placed texture.
+    uploaded: HashMap<usize, (ID3D12Resource, u64, bool)>,
     /// Uploaded textures by frame, oldest first, to look at again.
-    recheck: VecDeque<(u64, usize)>,
+    recheck: VecDeque<(u64, RecheckTarget)>,
     /// A frame and the uploads of known textures done in it.
     rechecks: (u64, u32),
     /// When the slot-making budget was last refilled, and the microseconds
@@ -120,6 +122,28 @@ struct Bindless {
     /// looked for in: at submission, at recording. Once per frame: the title
     /// releases and evicts all the time, and each look is over all slots.
     looked: [u64; 2],
+}
+
+/// A bindless texture queued for periodic CPU-memory recheck.
+#[derive(Clone, Copy)]
+enum RecheckTarget {
+    Placed(usize),
+    /// `(slot_index, view_index, generation, resource_address)`.
+    Ordinary(u32, u32, u32, usize),
+}
+
+enum PendingTex {
+    Placed((u32, u32)),
+    Ordinary((u32, u32)),
+}
+
+fn is_title_texture_srv(view: &View) -> bool {
+    matches!(
+        view,
+        View::Shader(r, _)
+            if crate::resource::host_resource(*r as crate::object::This)
+                .is_some_and(crate::texture::title_written)
+    )
 }
 
 /// Time for making changed slots, at submission and at recording: an eighth
@@ -138,9 +162,7 @@ impl Bindless {
     /// The slot-making budget, refilled for the time passed since.
     fn budget(&mut self) -> &mut [u64; 2] {
         let now = std::time::Instant::now();
-        let (at, left) = self
-            .budget
-            .get_or_insert((now, [SLOT_BUDGET_US; 2]));
+        let (at, left) = self.budget.get_or_insert((now, [SLOT_BUDGET_US; 2]));
         let add = now.duration_since(*at).as_micros() as u64 / 8;
         if add > 0 {
             *at = now;
@@ -720,6 +742,8 @@ impl HostHeap {
             if is_buf {
                 let placed = matches!(&view, View::Placed(false, r, _) if r[0] != 1);
                 self.track_bindless(index, (i, generation), placed);
+            } else if is_title_texture_srv(&view) {
+                self.track_ordinary_texture(index, (i, generation), key);
             } else {
                 self.untrack_bindless(index, key);
             }
@@ -756,7 +780,26 @@ impl HostHeap {
         } else {
             b.placed_set.remove(&index).is_some()
         };
+        b.texture_set.remove(&index);
         if changed {
+            b.record_pending.insert(index);
+            self.record_hint.store(true, Ordering::Release);
+        }
+    }
+
+    fn track_ordinary_texture(&self, index: u32, entry: (u32, u32), seen_key: u64) {
+        let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(seen) = b.seen.get_mut(index as usize) {
+            *seen = seen_key;
+        }
+        if b.slots.remove(&index).is_some() {
+            b.dirty.insert(index);
+            Self::recycle_bounce(&mut b, index);
+        }
+        if b.placed_set.remove(&index).is_some() {
+            b.recorded.remove(&index);
+        }
+        if b.texture_set.insert(index, entry) != Some(entry) {
             b.record_pending.insert(index);
             self.record_hint.store(true, Ordering::Release);
         }
@@ -774,6 +817,7 @@ impl HostHeap {
         if b.placed_set.remove(&index).is_some() {
             b.recorded.remove(&index);
         }
+        b.texture_set.remove(&index);
     }
 
     /// Scans title descriptor memory for slots written or overwritten as raw
@@ -831,6 +875,7 @@ impl HostHeap {
                         if b.placed_set.remove(&index).is_some() {
                             b.recorded.remove(&index);
                         }
+                        b.texture_set.remove(&index);
                         cleared.push(index);
                         continue;
                     }
@@ -842,6 +887,7 @@ impl HostHeap {
                         if b.placed_set.remove(&index).is_some() {
                             b.recorded.remove(&index);
                         }
+                        b.texture_set.remove(&index);
                         cleared.push(index);
                         continue;
                     };
@@ -857,6 +903,7 @@ impl HostHeap {
                         } else {
                             b.placed_set.remove(&index).is_some()
                         };
+                        b.texture_set.remove(&index);
                         if changed {
                             b.record_pending.insert(index);
                             self.record_hint.store(true, Ordering::Release);
@@ -868,6 +915,15 @@ impl HostHeap {
                         }
                         if b.placed_set.remove(&index).is_some() {
                             b.recorded.remove(&index);
+                        }
+                        if is_title_texture_srv(&view) {
+                            let entry = (vi, generation);
+                            if b.texture_set.insert(index, entry) != Some(entry) {
+                                b.record_pending.insert(index);
+                                self.record_hint.store(true, Ordering::Release);
+                            }
+                        } else {
+                            b.texture_set.remove(&index);
                         }
                         direct.push((index, key, view));
                     }
@@ -929,6 +985,9 @@ impl HostHeap {
             b.slots.remove(&index);
             Self::recycle_bounce(b, index);
             b.placed_set.remove(&index);
+        }
+        if entry.is_none_or(|e| b.texture_set.get(&index) == Some(&e)) {
+            b.texture_set.remove(&index);
         }
     }
 
@@ -1177,7 +1236,8 @@ impl HostHeap {
             };
             let b = &mut *b;
             if let Some(live) = &live {
-                b.uploaded.retain(|t, _| live.contains(t));
+                b.uploaded
+                    .retain(|t, (_, _, placed)| !*placed || live.contains(t));
                 for (&slot, &(_, t)) in &b.recorded {
                     if !live.contains(&t) {
                         b.record_pending.insert(slot);
@@ -1187,25 +1247,31 @@ impl HostHeap {
                 self.record_looked[0].store(epoch, Ordering::Release);
                 self.record_looked[1].store(frame + 1, Ordering::Release);
             }
-            let mut todo: Vec<(u32, Option<(u32, u32)>)> = Vec::new();
+            let mut todo: Vec<(u32, PendingTex)> = Vec::new();
             if b.budget()[1] > 0 {
                 while todo.len() < SLOT_CHUNK
                     && let Some(i) = b.record_pending.pop_first()
                 {
-                    todo.push((i, b.placed_set.get(&i).copied()));
+                    if let Some(entry) = b.placed_set.get(&i).copied() {
+                        todo.push((i, PendingTex::Placed(entry)));
+                    } else if let Some(entry) = b.texture_set.get(&i).copied() {
+                        todo.push((i, PendingTex::Ordinary(entry)));
+                    }
                 }
             }
             let mut due = Vec::new();
             while due.len() < RECHECKS as usize
                 && (b.rechecks.0 != frame || b.rechecks.1 < RECHECKS)
-                && let Some(&(f, t)) = b.recheck.front()
+                && let Some(&(f, target)) = b.recheck.front()
                 && f + RECHECK_FRAMES <= frame
             {
                 b.recheck.pop_front();
-                due.push(t as crate::object::This);
+                due.push((f, target));
             }
             self.recheck_at.store(
-                b.recheck.front().map_or(u64::MAX, |&(f, _)| f + RECHECK_FRAMES),
+                b.recheck
+                    .front()
+                    .map_or(u64::MAX, |&(f, _)| f + RECHECK_FRAMES),
                 Ordering::Release,
             );
             self.record_hint
@@ -1216,42 +1282,92 @@ impl HostHeap {
             return;
         }
         let mut stale = Vec::new();
+        let mut stale_ordinary: Vec<(usize, u64)> = Vec::new();
         let mut learnt = Vec::new();
         let mut reached = Vec::new();
+        let mut reached_ordinary = Vec::new();
         let left = self.budget_left(1);
         let mut todo = todo.into_iter();
         let mut over = Vec::new();
-        for (index, entry) in todo.by_ref() {
-            let Some((vi, generation)) = entry else {
-                continue;
-            };
+        for (index, item) in todo.by_ref() {
             if started.elapsed().as_micros() as u64 > left {
                 // Over budget: the rest waits (this one too).
                 over.push(index);
                 break;
             }
-            match self.resolve_placed(index, vi, generation) {
-                Ok(Some(held)) => {
-                    let key = u64::from(generation) << 32 | u64::from(vi);
-                    learnt.push((index, (key, held.as_this() as usize)));
-                    reached.push(held);
+            match item {
+                PendingTex::Placed((vi, generation)) => {
+                    match self.resolve_placed(index, vi, generation) {
+                        Ok(Some(held)) => {
+                            let key = u64::from(generation) << 32 | u64::from(vi);
+                            learnt.push((index, (key, held.as_this() as usize)));
+                            reached.push(held);
+                        }
+                        Ok(None) => {}
+                        Err(()) => stale.push(index),
+                    }
                 }
-                Ok(None) => {}
-                Err(()) => stale.push(index),
+                PendingTex::Ordinary((vi, generation)) => {
+                    match self.resolve_ordinary_texture(index, vi, generation) {
+                        Ok(Some(tex)) => reached_ordinary.push((index, vi, generation, tex)),
+                        Ok(None) => {}
+                        Err(()) => stale.push(index),
+                    }
+                }
             }
         }
         over.extend(todo.map(|(i, _)| i));
-        reached.extend(due.into_iter().filter_map(crate::resource::hold_placed));
+        for (recheck_frame, target) in due {
+            match target {
+                RecheckTarget::Placed(t) => {
+                    if let Some(held) = crate::resource::hold_placed(t as crate::object::This) {
+                        reached.push(held);
+                    }
+                }
+                RecheckTarget::Ordinary(slot, vi, generation, tex_addr) => {
+                    match self.resolve_ordinary_texture(slot, vi, generation) {
+                        Ok(Some(tex)) => reached_ordinary.push((slot, vi, generation, tex)),
+                        Ok(None) => {}
+                        Err(()) => {
+                            stale.push(slot);
+                            stale_ordinary.push((tex_addr, recheck_frame));
+                        }
+                    }
+                }
+            }
+        }
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
         for held in reached {
             let texture = held.as_this();
             let Some(host_tex) = crate::resource::host_resource(texture) else {
                 continue;
             };
-            if crate::texture::title_written(host_tex) && self.upload_due(texture, host_tex, frame)
+            if crate::texture::title_written(host_tex)
+                && self.upload_due(
+                    texture,
+                    host_tex,
+                    frame,
+                    RecheckTarget::Placed(texture as usize),
+                )
             {
                 crate::texture::upload(list, texture, host_tex);
             }
-            const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+            crate::list::ensure_state(list, texture, SHADER_RESOURCE);
+        }
+        for (slot, vi, generation, texture) in reached_ordinary {
+            let Some(host_tex) = crate::resource::host_resource(texture) else {
+                continue;
+            };
+            if crate::texture::title_written(host_tex)
+                && self.upload_due(
+                    texture,
+                    host_tex,
+                    frame,
+                    RecheckTarget::Ordinary(slot, vi, generation, texture as usize),
+                )
+            {
+                crate::texture::upload(list, texture, host_tex);
+            }
             crate::list::ensure_state(list, texture, SHADER_RESOURCE);
         }
         {
@@ -1259,6 +1375,14 @@ impl HostHeap {
             b.recorded.extend(learnt);
             for idx in stale {
                 self.drop_bindless(&mut b, idx, None);
+            }
+            for (tex_addr, recheck_frame) in stale_ordinary {
+                if b.uploaded
+                    .get(&tex_addr)
+                    .is_some_and(|&(_, last, placed)| !placed && last <= recheck_frame)
+                {
+                    b.uploaded.remove(&tex_addr);
+                }
             }
             b.record_pending.extend(over);
             self.record_hint
@@ -1310,18 +1434,48 @@ impl HostHeap {
         Ok(Some(held))
     }
 
-    /// Whether to upload placed texture `texture` (reached through a slot)
+    /// Resolves an ordinary resource-backed texture SRV at slot `index`:
+    /// `Err` if the view went stale (resource released), `None` if it is no
+    /// longer a texture SRV.
+    fn resolve_ordinary_texture(
+        &self,
+        index: u32,
+        vi: u32,
+        generation: u32,
+    ) -> Result<Option<crate::object::This>, ()> {
+        let Some(view) = view_at(vi, generation) else {
+            self.clear_stale_slot(index);
+            return Err(());
+        };
+        let View::Shader(r, _) = view else {
+            return Ok(None);
+        };
+        let tex = r as crate::object::This;
+        if crate::resource::host_resource(tex).is_none() {
+            return Ok(None);
+        }
+        Ok(Some(tex))
+    }
+
+    /// Whether to upload bindless texture `texture` (reached through a slot)
     /// in a list recorded in `frame`: the first time, then as
     /// [`RECHECK_FRAMES`] allows.
-    fn upload_due(&self, texture: crate::object::This, host: &ID3D12Resource, frame: u64) -> bool {
+    fn upload_due(
+        &self,
+        texture: crate::object::This,
+        host: &ID3D12Resource,
+        frame: u64,
+        target: RecheckTarget,
+    ) -> bool {
         use windows::core::Interface;
+        let is_placed = matches!(target, RecheckTarget::Placed(_));
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
         let b = &mut *b;
         let due = match b.uploaded.get(&(texture as usize)) {
             None => true,
             // Another texture at the object's address.
-            Some((h, _)) if h.as_raw() != host.as_raw() => true,
-            Some((_, last)) if frame >= last + RECHECK_FRAMES => {
+            Some((h, _, _)) if h.as_raw() != host.as_raw() => true,
+            Some((_, last, _)) if frame >= last + RECHECK_FRAMES => {
                 if b.rechecks.0 != frame {
                     b.rechecks = (frame, 0);
                 }
@@ -1332,10 +1486,12 @@ impl HostHeap {
         };
         if due {
             b.uploaded
-                .insert(texture as usize, (host.clone(), frame));
-            b.recheck.push_back((frame, texture as usize));
+                .insert(texture as usize, (host.clone(), frame, is_placed));
+            b.recheck.push_back((frame, target));
             self.recheck_at.store(
-                b.recheck.front().map_or(u64::MAX, |&(f, _)| f + RECHECK_FRAMES),
+                b.recheck
+                    .front()
+                    .map_or(u64::MAX, |&(f, _)| f + RECHECK_FRAMES),
                 Ordering::Release,
             );
         }
@@ -2677,21 +2833,34 @@ void main() {
         let (a, _) = host.shared_buffer(1 << 16).unwrap();
         let (b, _) = host.shared_buffer(1 << 16).unwrap();
         let tex = 0x1000 as crate::object::This;
-        assert!(heap.upload_due(tex, &a, 10), "first reach uploads");
-        assert!(!heap.upload_due(tex, &a, 10));
-        assert!(!heap.upload_due(tex, &a, 10 + RECHECK_FRAMES - 1));
-        assert!(heap.upload_due(tex, &b, 11), "a new texture at the address");
-        assert!(heap.upload_due(tex, &b, 11 + RECHECK_FRAMES), "looked at again");
+        let target = |t: crate::object::This| RecheckTarget::Placed(t as usize);
+        assert!(
+            heap.upload_due(tex, &a, 10, target(tex)),
+            "first reach uploads"
+        );
+        assert!(!heap.upload_due(tex, &a, 10, target(tex)));
+        assert!(!heap.upload_due(tex, &a, 10 + RECHECK_FRAMES - 1, target(tex)));
+        assert!(
+            heap.upload_due(tex, &b, 11, target(tex)),
+            "a new texture at the address"
+        );
+        assert!(
+            heap.upload_due(tex, &b, 11 + RECHECK_FRAMES, target(tex)),
+            "looked at again"
+        );
         // At most `RECHECKS` known textures per frame.
         let frame = 1000;
         let many: Vec<_> = (0..2 * RECHECKS as usize)
             .map(|i| {
                 let t = (0x2000 + i) as crate::object::This;
-                assert!(heap.upload_due(t, &a, 0));
+                assert!(heap.upload_due(t, &a, 0, target(t)));
                 t
             })
             .collect();
-        let again = many.iter().filter(|&&t| heap.upload_due(t, &a, frame)).count();
+        let again = many
+            .iter()
+            .filter(|&&t| heap.upload_due(t, &a, frame, target(t)))
+            .count();
         assert_eq!(again, RECHECKS as usize);
     }
 
@@ -2939,5 +3108,207 @@ void main() {
         assert_eq!(release(title_heap), 0);
         // SAFETY: frees our `VirtualAlloc` region.
         unsafe { VirtualFree(base_ptr as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// An ordinary resource-backed CPU texture SRV reached only through a
+    /// shader-visible bindless heap schedules its initial upload during
+    /// `prepare_bindless_record` and re-uploads after `RECHECK_FRAMES`.
+    #[test]
+    fn ordinary_bindless_texture_srv_uploads_and_refreshes_on_gpu() {
+        const TEX_PROBE_HLSL: &str = r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=1)), \
+            DescriptorTable(UAV(u0, numDescriptors=1))"
+Texture2D<float4> tex : register(t0);
+RWByteAddressBuffer out_buf : register(u0);
+
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    float4 px = tex.Load(int3(0, 0, 0));
+    uint packed = (uint(round(px.x * 255.0)) << 0)
+                | (uint(round(px.y * 255.0)) << 8)
+                | (uint(round(px.z * 255.0)) << 16)
+                | (uint(round(px.w * 255.0)) << 24);
+    out_buf.Store(0, packed);
+}
+"#;
+        let Some(host) = host() else {
+            return;
+        };
+        let (title_heap, base) = make_shader_heap(8);
+        let slot_handle = |i: u64| base + i * 32;
+
+        let mem = crate::resource::Memory::zeroed(128 << 10, 64 << 10).unwrap();
+        let uav_addr = mem.address();
+        let tex_addr = mem.address() + (64 << 10);
+        // SAFETY: offsets lie within `mem`.
+        unsafe {
+            (uav_addr as *mut u32).write(0);
+            (tex_addr as *mut [u8; 4]).write([0x12, 0x34, 0x56, 0x78]);
+        }
+
+        let uav_res = make_title_buffer(uav_addr, 256, true);
+        let tex_desc_words: [u32; 14] = [
+            3, // TEXTURE2D
+            0,
+            0,
+            0,
+            4,
+            0,
+            4,
+            0x0001_0001,
+            DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            1,
+            0,
+            0x100, // console LINEAR layout
+            0,
+            0,
+        ];
+        let mut tex_res = std::ptr::null();
+        assert_eq!(
+            crate::resource::create_at_address(
+                std::ptr::null(),
+                tex_addr,
+                tex_desc_words.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &RESOURCE_IID,
+                &mut tex_res,
+            ),
+            S_OK
+        );
+
+        let tex_srv_host = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        let uav_desc_host = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: 0,
+                    NumElements: 16,
+                    StructureByteStride: 0,
+                    CounterOffsetInBytes: 0,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: both D3D12 view descriptions are 40-byte POD values (`[u32; 10]`).
+        let (tex_srv_words, uav_words): ([u32; 10], [u32; 10]) = unsafe {
+            (
+                std::ptr::from_ref(&tex_srv_host).cast::<[u32; 10]>().read(),
+                std::ptr::from_ref(&uav_desc_host)
+                    .cast::<[u32; 10]>()
+                    .read(),
+            )
+        };
+        create_srv(std::ptr::null(), tex_res, &tex_srv_words, slot_handle(0));
+        create_uav(
+            std::ptr::null(),
+            uav_res,
+            std::ptr::null(),
+            &uav_words,
+            slot_handle(1),
+        );
+
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: static HLSL source and entry point; out pointer ours.
+        let (root, pso) = unsafe {
+            D3DCompile(
+                TEX_PROBE_HLSL.as_ptr().cast(),
+                TEX_PROBE_HLSL.len(),
+                s!("ordinary_tex_probe"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+            .unwrap();
+            let code = code.unwrap();
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        let list = host.new_list().unwrap();
+        let run_probe = |list: &crate::host::HostList, expect_scheduled: bool| {
+            host_heap.prepare_bindless_record(list);
+            if expect_scheduled {
+                assert!(
+                    !list.first_use(tex_res as usize),
+                    "ordinary bindless texture SRV must schedule its upload on the list"
+                );
+            }
+            list.defer_bindless(&host_heap, true);
+            // SAFETY: open command list, shader-visible heap, and matching root/PSO.
+            unsafe {
+                let gpu_start = host_heap.heap.GetGPUDescriptorHandleForHeapStart().ptr;
+                let gpu_at = |slot_idx: u32| D3D12_GPU_DESCRIPTOR_HANDLE {
+                    ptr: gpu_start + u64::from(slot_idx) * u64::from(host_heap.step),
+                };
+                list.list
+                    .SetDescriptorHeaps(&[Some(host_heap.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                list.list.SetComputeRootDescriptorTable(0, gpu_at(0));
+                list.list.SetComputeRootDescriptorTable(1, gpu_at(1));
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[list]);
+            list.reset();
+        };
+
+        // First draw must upload the ordinary CPU-backed texture and sample it.
+        run_probe(&list, true);
+        // SAFETY: GPU finished and copied UAV output back to `uav_addr`.
+        let first = unsafe { (uav_addr as *const u32).read_volatile() };
+        assert_eq!(first, 0x7856_3412);
+
+        // Modify CPU bytes and advance past the normal recheck interval.
+        // SAFETY: inside `mem`.
+        unsafe { (tex_addr as *mut [u8; 4]).write([0x87, 0x65, 0x43, 0x21]) };
+        for _ in 0..RECHECK_FRAMES {
+            crate::queue::pass_frame();
+        }
+        run_probe(&list, true);
+        // SAFETY: GPU finished and copied UAV output back to `uav_addr`.
+        let second = unsafe { (uav_addr as *const u32).read_volatile() };
+        assert_eq!(second, 0x2143_6587);
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(tex_res), 0);
+        assert_eq!(release(uav_res), 0);
+        assert_eq!(release(title_heap), 0);
     }
 }
