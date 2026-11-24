@@ -91,14 +91,16 @@ The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
 
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+Input: XInput pads. A DualSense or DualSense Edge (USB or Bluetooth) is read
+over HID as well and plays as the first pad when no XInput pad answers. With
+no pad connected the keyboard is a pad while the title's window has focus:
 
 | Keys | Pad |
 |------|-----|
 | W A S D / I J K L | left / right stick |
 | arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
+| Enter, O | A, B |
+| Backspace, X, Y | B, X, Y |
 | Q / E, Z / C | shoulders, triggers |
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
