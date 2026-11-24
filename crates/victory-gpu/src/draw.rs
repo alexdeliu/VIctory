@@ -1496,7 +1496,7 @@ mod tests {
     /// not of one that has not, and the list that lost them is refused.
     #[test]
     fn a_full_heap_takes_back_the_slots_of_a_list_that_ran() {
-        let Some(heap) = HostHeap::new(false, 4) else {
+        let Some(heap) = HostHeap::new(false, 4, 0) else {
             return; // no host GPU
         };
         let key = 0x2000_0001;
@@ -1539,7 +1539,7 @@ mod tests {
     /// list reset by the title gives back its own and is not taken twice.
     #[test]
     fn a_running_or_reset_list_is_not_taken_back() {
-        let Some(heap) = HostHeap::new(false, 4) else {
+        let Some(heap) = HostHeap::new(false, 4, 0) else {
             return; // no host GPU
         };
         let key = 0x2000_0002;

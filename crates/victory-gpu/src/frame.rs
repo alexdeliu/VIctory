@@ -114,6 +114,8 @@ fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
     // not a whole extra interval (30 fps falling straight to 15).
     let passed = c.first + (elapsed / interval) as u64;
     if kind != ORIGIN && passed > last_tick && passed > c.first {
+        // No wait, so always within `limit`: it takes the tick (as below).
+        last(kind).fetch_max(passed, Ordering::Relaxed);
         return (passed, Duration::ZERO);
     }
     let tick = (c.first + (elapsed / interval + 1) as u64).max(last_tick + 1);
